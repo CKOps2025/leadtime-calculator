@@ -1,0 +1,375 @@
+// Manufacturing Scheduling Backend
+const express = require('express');
+const bodyParser = require('body-parser');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(bodyParser.json());
+
+// Constants
+const DOWNTIME_FACTOR = 0.2; // 20% expected downtime
+
+// Load the reference table for post-processing steps
+const loadPostProcessingTable = () => {
+  try {
+    const data = fs.readFileSync(path.join(__dirname, 'post_processing_reference.json'), 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('Error loading post-processing reference table:', error);
+    // Return a default table if file is missing
+    return {
+      "painting": { "duration": 48, "canRunParallel": false },
+      "quality_check": { "duration": 24, "canRunParallel": true },
+      "packaging": { "duration": 16, "canRunParallel": false },
+      "heat_treatment": { "duration": 72, "canRunParallel": false },
+      "assembly": { "duration": 40, "canRunParallel": false },
+      "polishing": { "duration": 32, "canRunParallel": true }
+    };
+  }
+};
+
+// Load current production schedule
+const loadProductionSchedule = () => {
+  try {
+    const data = fs.readFileSync(path.join(__dirname, 'production_schedule.json'), 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('Error loading production schedule:', error);
+    return []; // Return empty schedule if file is missing
+  }
+};
+
+// Save updated production schedule
+const saveProductionSchedule = (schedule) => {
+  try {
+    fs.writeFileSync(
+      path.join(__dirname, 'production_schedule.json'),
+      JSON.stringify(schedule, null, 2),
+      'utf8'
+    );
+    return true;
+  } catch (error) {
+    console.error('Error saving production schedule:', error);
+    return false;
+  }
+};
+
+// Find the earliest available start date based on current production
+const findEarliestStartDate = (productionLine, schedule) => {
+  const now = new Date();
+  let earliestStart = new Date(now);
+  
+  // Filter for items in the same production line
+  const lineItems = schedule.filter(item => item.productionLine === productionLine);
+  
+  if (lineItems.length > 0) {
+    // Sort by delivery date to find the latest one
+    lineItems.sort((a, b) => new Date(b.deliveryDate) - new Date(a.deliveryDate));
+    
+    // Set earliest start to a day after the latest delivery date
+    earliestStart = new Date(lineItems[0].deliveryDate);
+    earliestStart.setDate(earliestStart.getDate() + 1);
+  }
+  
+  return earliestStart;
+};
+
+// Calculate the total processing time with downtime factor
+const calculateProcessingTime = (productionTime, postProcessingSteps, postProcessingTable) => {
+  // Apply downtime factor to production time
+  const adjustedProductionTime = productionTime * (1 + DOWNTIME_FACTOR);
+  
+  // Calculate total post-processing time
+  let totalPostProcessingTime = 0;
+  let maxParallelTime = 0;
+  
+  postProcessingSteps.forEach(step => {
+    const processInfo = postProcessingTable[step];
+    if (!processInfo) {
+      console.warn(`Post-processing step "${step}" not found in reference table.`);
+      return;
+    }
+    
+    if (processInfo.canRunParallel) {
+      // For parallel steps, we only consider the longest one
+      maxParallelTime = Math.max(maxParallelTime, processInfo.duration);
+    } else {
+      // For sequential steps, we add up the time
+      totalPostProcessingTime += processInfo.duration;
+    }
+  });
+  
+  // Add the parallel time to the sequential time
+  totalPostProcessingTime += maxParallelTime;
+  
+  // Apply downtime factor to post-processing time
+  const adjustedPostProcessingTime = totalPostProcessingTime * (1 + DOWNTIME_FACTOR);
+  
+  return {
+    productionHours: adjustedProductionTime,
+    postProcessingHours: adjustedPostProcessingTime,
+    totalHours: adjustedProductionTime + adjustedPostProcessingTime
+  };
+};
+
+// Calculate delivery date based on start date and processing time
+const calculateDeliveryDate = (startDate, totalProcessingHours) => {
+  const deliveryDate = new Date(startDate);
+  
+  // Assuming 8 working hours per day
+  const workDays = Math.ceil(totalProcessingHours / 8);
+  deliveryDate.setDate(deliveryDate.getDate() + workDays);
+  
+  return deliveryDate;
+};
+
+// Endpoint to get scheduling information for a new job
+app.post('/api/schedule', (req, res) => {
+  try {
+    const {
+      productName,
+      productionLine,
+      productionTimeHours,
+      postProcessingSteps,
+      priority = 'normal' // Priority can be 'high', 'normal', or 'low'
+    } = req.body;
+    
+    // Validate required fields
+    if (!productName || !productionLine || !productionTimeHours || !postProcessingSteps) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Load reference tables and schedules
+    const postProcessingTable = loadPostProcessingTable();
+    const productionSchedule = loadProductionSchedule();
+    
+    // Find earliest start date
+    let startDate = findEarliestStartDate(productionLine, productionSchedule);
+    
+    // Adjust start date based on priority
+    if (priority === 'high') {
+      // High priority jobs start sooner
+      startDate = new Date(); // Start today
+    } else if (priority === 'low') {
+      // Low priority jobs can be delayed
+      startDate.setDate(startDate.getDate() + 3); // Add 3 days buffer
+    }
+    
+    // Calculate processing time
+    const processingTime = calculateProcessingTime(
+      productionTimeHours,
+      postProcessingSteps,
+      postProcessingTable
+    );
+    
+    // Calculate delivery date
+    const deliveryDate = calculateDeliveryDate(startDate, processingTime.totalHours);
+    
+    // Create new job entry
+    const newJob = {
+      id: Date.now().toString(),
+      productName,
+      productionLine,
+      startDate: startDate.toISOString(),
+      deliveryDate: deliveryDate.toISOString(),
+      productionTimeHours: productionTimeHours,
+      adjustedProductionHours: processingTime.productionHours,
+      postProcessingSteps,
+      postProcessingHours: processingTime.postProcessingHours,
+      totalProcessingHours: processingTime.totalHours,
+      priority,
+      status: 'scheduled'
+    };
+    
+    // Add to schedule
+    productionSchedule.push(newJob);
+    saveProductionSchedule(productionSchedule);
+    
+    // Return the scheduling information
+    res.json({
+      job: newJob,
+      message: 'Job scheduled successfully'
+    });
+  } catch (error) {
+    console.error('Error scheduling job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint to get all scheduled jobs
+app.get('/api/schedule', (req, res) => {
+  try {
+    const productionSchedule = loadProductionSchedule();
+    res.json(productionSchedule);
+  } catch (error) {
+    console.error('Error fetching production schedule:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint to get specific job by ID
+app.get('/api/schedule/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const productionSchedule = loadProductionSchedule();
+    const job = productionSchedule.find(job => job.id === id);
+    
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    res.json(job);
+  } catch (error) {
+    console.error('Error fetching job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint to update a job
+app.put('/api/schedule/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    const productionSchedule = loadProductionSchedule();
+    const jobIndex = productionSchedule.findIndex(job => job.id === id);
+    
+    if (jobIndex === -1) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    // Don't allow changing critical fields that would affect scheduling
+    const protectedFields = ['id', 'startDate', 'deliveryDate'];
+    protectedFields.forEach(field => {
+      if (updates[field]) {
+        delete updates[field];
+      }
+    });
+    
+    // Update job
+    productionSchedule[jobIndex] = {
+      ...productionSchedule[jobIndex],
+      ...updates,
+      updatedAt: new Date().toISOString()
+    };
+    
+    saveProductionSchedule(productionSchedule);
+    
+    res.json({
+      job: productionSchedule[jobIndex],
+      message: 'Job updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint to delete a job
+app.delete('/api/schedule/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const productionSchedule = loadProductionSchedule();
+    const jobIndex = productionSchedule.findIndex(job => job.id === id);
+    
+    if (jobIndex === -1) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    // Remove job
+    const removedJob = productionSchedule.splice(jobIndex, 1)[0];
+    saveProductionSchedule(productionSchedule);
+    
+    res.json({
+      job: removedJob,
+      message: 'Job deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint to recalculate schedule after changes
+app.post('/api/schedule/recalculate', (req, res) => {
+  try {
+    const productionSchedule = loadProductionSchedule();
+    const postProcessingTable = loadPostProcessingTable();
+    
+    // Group jobs by production line
+    const lineGroups = {};
+    productionSchedule.forEach(job => {
+      if (!lineGroups[job.productionLine]) {
+        lineGroups[job.productionLine] = [];
+      }
+      lineGroups[job.productionLine].push(job);
+    });
+    
+    // Sort each group by priority and then by original start date
+    Object.keys(lineGroups).forEach(line => {
+      lineGroups[line].sort((a, b) => {
+        // Sort by priority first
+        const priorityOrder = { 'high': 0, 'normal': 1, 'low': 2 };
+        if (priorityOrder[a.priority] !== priorityOrder[b.priority]) {
+          return priorityOrder[a.priority] - priorityOrder[b.priority];
+        }
+        // Then by original start date
+        return new Date(a.startDate) - new Date(b.startDate);
+      });
+    });
+    
+    // Recalculate schedule for each line
+    const updatedSchedule = [];
+    Object.keys(lineGroups).forEach(line => {
+      let currentDate = new Date();
+      
+      lineGroups[line].forEach(job => {
+        // Recalculate processing time
+        const processingTime = calculateProcessingTime(
+          job.productionTimeHours,
+          job.postProcessingSteps,
+          postProcessingTable
+        );
+        
+        // Update start date
+        job.startDate = currentDate.toISOString();
+        
+        // Update delivery date
+        const deliveryDate = calculateDeliveryDate(currentDate, processingTime.totalHours);
+        job.deliveryDate = deliveryDate.toISOString();
+        
+        // Update processing times
+        job.adjustedProductionHours = processingTime.productionHours;
+        job.postProcessingHours = processingTime.postProcessingHours;
+        job.totalProcessingHours = processingTime.totalHours;
+        
+        // Add to updated schedule
+        updatedSchedule.push(job);
+        
+        // Move current date for next job
+        currentDate = new Date(deliveryDate);
+        currentDate.setDate(currentDate.getDate() + 1);
+      });
+    });
+    
+    saveProductionSchedule(updatedSchedule);
+    
+    res.json({
+      message: 'Schedule recalculated successfully',
+      schedule: updatedSchedule
+    });
+  } catch (error) {
+    console.error('Error recalculating schedule:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app; // For testing purposes
